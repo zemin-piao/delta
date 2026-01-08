@@ -447,28 +447,34 @@ abstract class OptimizedWritesSuiteBase extends QueryTest
     }
   }
 
-  test("optimized write with binSize limits output file size") {
+  test("optimized write with binSize limits output file size for large reducers") {
     withTempDir { dir =>
       // First, write some data to establish baseline statistics
-      val setupDf = spark.range(0, 10000, 1, 4).toDF()
+      val setupDf = spark.range(0, 100000, 1, 4).toDF()
       setupDf.write.format("delta").save(dir.getCanonicalPath)
 
-      // Now write more data with binSize controlling output file size
+      // Write more data with few partitions to create large reducers exceeding binSize
       withSQLConf(
         DeltaSQLConf.DELTA_OPTIMIZE_WRITE_ENABLED.key -> "true",
         DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true",
         DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE.key -> "1"  // 1 MiB
       ) {
-        val df = spark.range(10000, 110000, 1, 10).toDF()
+        // Use only 2 partitions to force large reducers (each > 1 MiB)
+        val df = spark.range(100000, 500000, 1, 2).toDF()
         df.write.format("delta").mode("append").save(dir.getCanonicalPath)
       }
 
-      // Verify files are reasonably sized (within 2x of binSize due to estimation variance)
+      // Verify files are split and reasonably sized
+      // (within 2x of binSize due to estimation variance)
       val (_, snapshot) = DeltaLog.forTableWithSnapshot(spark, dir.getCanonicalPath)
       val newFiles = snapshot.allFiles.collect().filter(_.size > 0)
       val maxFileSize = newFiles.map(_.size).max
 
-      assert(maxFileSize < 2 * 1048576, s"Max file size $maxFileSize exceeds 2x binSize")
+      assert(maxFileSize < 2 * 1048576,
+        s"Max file size $maxFileSize exceeds 2x binSize (2 MiB)")
+      // Should have multiple files due to splitting
+      assert(newFiles.length > 2,
+        s"Expected multiple files from splitting, got ${newFiles.length}")
     }
   }
 
@@ -488,6 +494,93 @@ abstract class OptimizedWritesSuiteBase extends QueryTest
         val result = spark.read.format("delta").load(dir.getCanonicalPath)
         assert(result.count() == 10000)
       }
+    }
+  }
+
+  test("optimized write with small reducers skips maxRecordsPerFile estimation") {
+    withTempDir { dir =>
+      // First, write some data to establish baseline statistics
+      val setupDf = spark.range(0, 100000, 1, 4).toDF()
+      setupDf.write.format("delta").save(dir.getCanonicalPath)
+
+      // Write data with many partitions to create small reducers (each < binSize)
+      withSQLConf(
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_ENABLED.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE.key -> "512"  // 512 MiB (very large)
+      ) {
+        // Use 100 partitions - each reducer will be small
+        val df = spark.range(100000, 200000, 1, 100).toDF()
+        df.write.format("delta").mode("append").save(dir.getCanonicalPath)
+      }
+
+      // Since all reducers are small, no file splitting should occur
+      // Files should naturally be small without maxRecordsPerFile being set
+      val (_, snapshot) = DeltaLog.forTableWithSnapshot(spark, dir.getCanonicalPath)
+      val newFiles = snapshot.allFiles.collect().filter(_.size > 0)
+
+      // All files should be relatively small (well under 512 MiB)
+      assert(newFiles.forall(_.size < 10 * 1048576),
+        "Expected all files to be small since reducers are < binSize")
+    }
+  }
+
+  test("optimized write uses optimize.maxFileSize as cap") {
+    withTempDir { dir =>
+      // First, write some data to establish baseline statistics
+      val setupDf = spark.range(0, 100000, 1, 4).toDF()
+      setupDf.write.format("delta").save(dir.getCanonicalPath)
+
+      // Set binSize=10 MiB, but cap at optimize.maxFileSize=2 MiB
+      withSQLConf(
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_ENABLED.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE.key -> "10",  // 10 MiB
+        DeltaSQLConf.DELTA_OPTIMIZE_MAX_FILE_SIZE.key -> (2 * 1048576).toString  // 2 MiB
+      ) {
+        // Use few partitions to create large reducers
+        val df = spark.range(100000, 500000, 1, 2).toDF()
+        df.write.format("delta").mode("append").save(dir.getCanonicalPath)
+      }
+
+      // Verify files respect the optimize.maxFileSize cap (2 MiB)
+      val (_, snapshot) = DeltaLog.forTableWithSnapshot(spark, dir.getCanonicalPath)
+      val newFiles = snapshot.allFiles.collect().filter(_.size > 0)
+      val maxFileSize = newFiles.map(_.size).max
+
+      // Files should be capped at ~2 MiB (with 2x error budget = 4 MiB)
+      assert(maxFileSize < 4 * 1048576,
+        s"Max file size $maxFileSize exceeds 2x optimize.maxFileSize (4 MiB)")
+    }
+  }
+
+  test("optimized write respects min(binSize, optimize.maxFileSize)") {
+    withTempDir { dir =>
+      // First, write some data to establish baseline statistics
+      val setupDf = spark.range(0, 100000, 1, 4).toDF()
+      setupDf.write.format("delta").save(dir.getCanonicalPath)
+
+      // Set optimize.maxFileSize > binSize - should use binSize as target
+      withSQLConf(
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_ENABLED.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE.key -> "1",  // 1 MiB
+        DeltaSQLConf.DELTA_OPTIMIZE_MAX_FILE_SIZE.key -> (100 * 1048576).toString  // 100 MiB
+      ) {
+        val df = spark.range(100000, 500000, 1, 2).toDF()
+        df.write.format("delta").mode("append").save(dir.getCanonicalPath)
+      }
+
+      // Verify files target binSize (1 MiB), not optimize.maxFileSize (100 MiB)
+      val (_, snapshot) = DeltaLog.forTableWithSnapshot(spark, dir.getCanonicalPath)
+      val newFiles = snapshot.allFiles.collect().filter(_.size > 0)
+      val maxFileSize = newFiles.map(_.size).max
+
+      // Files should be around binSize (1 MiB with 2x error budget = 2 MiB)
+      assert(maxFileSize < 2 * 1048576,
+        s"Max file size $maxFileSize should target binSize (1 MiB), not optimize.maxFileSize")
+      assert(maxFileSize < 10 * 1048576,
+        s"Files should be much smaller than optimize.maxFileSize (100 MiB)")
     }
   }
 }

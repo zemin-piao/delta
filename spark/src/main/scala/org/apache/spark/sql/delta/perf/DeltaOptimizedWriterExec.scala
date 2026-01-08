@@ -101,7 +101,8 @@ case class DeltaOptimizedWriterExec(
     cachedShuffleRDD
   }
 
-  private def computeBins(): Array[List[(BlockManagerId, ArrayBuffer[(BlockId, Long, Int)])]] = {
+  private def computeBins():
+      (Array[List[(BlockManagerId, ArrayBuffer[(BlockId, Long, Int)])]], Boolean) = {
     // Get all shuffle information
     val shuffleStats = getShuffleStats()
 
@@ -122,7 +123,7 @@ case class DeltaOptimizedWriterExec(
         (reducerId, blocks, blocks.map(_._2).sum)
       }.toSeq
 
-    val bins = if (useShuffleManager) {
+    val (bins, hasLargeReducers) = if (useShuffleManager) {
       // Remote shuffle mode: Never split reducers across bins to avoid duplicate reads.
       // ShuffleManager.getReader() reads entire partitions, so if a reducer is split
       // across bins, each bin would read the full partition causing data duplication.
@@ -157,21 +158,22 @@ case class DeltaOptimizedWriterExec(
         s"Reducer(s) split across multiple bins in remote shuffle mode, " +
           s"which would cause data duplication: ${duplicates.keys.mkString(", ")}")
 
-      result
+      (result, largeReducers.nonEmpty)
     } else {
       // Local shuffle mode: Bin-pack individual blocks for optimal bin sizes.
       // ShuffleBlockFetcherIterator can fetch specific blocks, so splitting
       // a reducer across bins is safe and allows for better bin packing.
-      reducerGroups.flatMap { case (_, blocks, _) =>
+      val localBins = reducerGroups.flatMap { case (_, blocks, _) =>
         BinPackingUtils.binPackBySize[(BlockId, Long, Int), BlockId](
           blocks,
           _._2, // size
           _._1, // blockId
           maxBinSize)
       }
+      (localBins, false) // Local mode doesn't need maxRecordsPerFile control
     }
 
-    bins
+    val partitions = bins
       .map { bin =>
         var binSize = 0L
         val blockLocations =
@@ -188,6 +190,8 @@ case class DeltaOptimizedWriterExec(
       .toArray
       .sortBy(_._1)(Ordering[Long].reverse) // submit largest blocks first
       .map(_._2)
+
+    (partitions, hasLargeReducers)
   }
 
   /** Performs the shuffle before the write, so that we can bin-pack output data. */
@@ -268,23 +272,31 @@ case class DeltaOptimizedWriterExec(
 
     val shuffledRDD = getShuffleRDD
 
-    val partitions = computeBins()
+    val (partitions, hasLargeReducers) = computeBins()
 
     if (useShuffleManager) {
       logInfo("Using ShuffleManager API for optimized write (remote shuffle service mode)")
     }
 
-    // Estimate and set maxRecordsPerFile based on binSize for remote shuffle mode
-    // This helps control output file size when reducers exceed binSize
-    if (useShuffleManager) {
-      val maxBinSize = ByteUnit.BYTE.convertFrom(
+    // Only estimate and set maxRecordsPerFile when there are large reducers (exceeding binSize)
+    // Small reducers don't need file splitting - they naturally produce files <= binSize
+    if (useShuffleManager && hasLargeReducers) {
+      val binSize = ByteUnit.BYTE.convertFrom(
         getConf(DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE), ByteUnit.MiB)
-      estimateMaxRecordsPerFile(maxBinSize).foreach { maxRecords =>
+      val maxFileSize = getConf(DeltaSQLConf.DELTA_OPTIMIZE_MAX_FILE_SIZE)
+
+      // Use binSize as target, but cap at optimize.maxFileSize for safety against estimation errors
+      // If optimize.maxFileSize < binSize, respect the user's preference for smaller files
+      val targetFileSize = math.min(binSize, maxFileSize)
+
+      estimateMaxRecordsPerFile(targetFileSize).foreach { maxRecords =>
         // Set as thread-local property to be picked up by the write path
         sparkContext.setLocalProperty(
           "spark.sql.files.maxRecordsPerFile",
           maxRecords.toString
         )
+        logInfo(s"Set maxRecordsPerFile=$maxRecords for large reducers " +
+          s"(binSize=${binSize}B, targetFileSize=${targetFileSize}B)")
       }
     }
 

@@ -1941,7 +1941,11 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
   val DELTA_OPTIMIZE_MAX_FILE_SIZE =
     buildConf("optimize.maxFileSize")
         .internal()
-        .doc("Target file size produced by the OPTIMIZE command.")
+        .doc("Target file size produced by the OPTIMIZE command. " +
+          "Also used as a safety cap for optimizeWrite with remote shuffle services: " +
+          "when large reducers exceed binSize, files are split based on estimated " +
+          "avgBytesPerRecord, but capped at this value to handle estimation errors. " +
+          "Recommended: 2-4x binSize to provide error budget for estimation variance.")
         .longConf
         .checkValue(_ >= 0, "maxFileSize has to be positive")
         .createWithDefault(1024 * 1024 * 1024)
@@ -2723,7 +2727,11 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
   val DELTA_OPTIMIZE_WRITE_BIN_SIZE =
     buildConf("optimizeWrite.binSize")
       .internal()
-      .doc("Bin size for the adaptive shuffle in optimized writes in megabytes.")
+      .doc("Bin size for the adaptive shuffle in optimized writes in megabytes. " +
+        "Controls shuffle data grouping and target output file size. " +
+        "For large reducers exceeding binSize, output files are split using estimated " +
+        "maxRecordsPerFile, capped by optimize.maxFileSize. See also: " +
+        "optimizeWrite.binSize.sampleSize, optimize.maxFileSize.")
       .bytesConf(ByteUnit.MiB)
       .createWithDefault(512)
 

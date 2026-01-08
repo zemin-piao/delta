@@ -222,41 +222,41 @@ case class DeltaOptimizedWriterExec(
    * Algorithm:
    * 1. Sample N files from the existing table (default: 100)
    * 2. Calculate avgBytesPerRecord = totalSampleBytes / totalSampleRecords
-   * 3. Return targetFileSize / avgBytesPerRecord
+   * 3. Return binSize / avgBytesPerRecord
    *
-   * @param targetFileSize Desired maximum file size in bytes
+   * @param binSize Target bin size in bytes (used as target file size)
    * @return Some(maxRecordsPerFile) if estimation possible, None otherwise
    */
-  private def estimateMaxRecordsPerFile(targetFileSize: Long): Option[Long] = {
-    if (targetFileSize <= 0) return None
+  private def estimateMaxRecordsPerFile(binSize: Long): Option[Long] = {
+    if (binSize <= 0) return None
 
-    val sampleSize = getConf(DeltaSQLConf.DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE_SAMPLE_SIZE)
+    val sampleSize = getConf(DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE_SAMPLE_SIZE)
     val snapshot = deltaLog.unsafeVolatileSnapshot
 
     // Sample files from the table - O(sampleSize), not O(totalFiles)
     val sampleFiles = snapshot.allFiles
       .limit(sampleSize)
       .collect()
-      .filter(f => f.numRecords.isDefined && f.numRecords.get > 0 && f.size > 0)
+      .filter(f => f.numPhysicalRecords.isDefined && f.numPhysicalRecords.get > 0 && f.size > 0)
 
     // Need minimum 10 files with valid stats for reliable estimation
     if (sampleFiles.length < 10) {
       logWarning(
         s"Insufficient files with statistics (${sampleFiles.length}) to estimate " +
-        s"maxRecordsPerFile. targetFileSize will not be enforced."
+        s"maxRecordsPerFile. File size control via binSize will not be enforced."
       )
       return None
     }
 
     val totalBytes = sampleFiles.map(_.size).sum
-    val totalRecords = sampleFiles.flatMap(_.numRecords).sum
+    val totalRecords = sampleFiles.flatMap(_.numPhysicalRecords).sum
     val avgBytesPerRecord = totalBytes.toDouble / totalRecords
 
-    val maxRecordsPerFile = (targetFileSize / avgBytesPerRecord).toLong
+    val maxRecordsPerFile = (binSize / avgBytesPerRecord).toLong
 
     logInfo(
       s"Estimated avgBytesPerRecord=$avgBytesPerRecord from ${sampleFiles.length} files. " +
-      s"Setting maxRecordsPerFile=$maxRecordsPerFile for targetFileSize=$targetFileSize"
+      s"Setting maxRecordsPerFile=$maxRecordsPerFile for binSize=$binSize"
     )
 
     Some(math.max(1, maxRecordsPerFile))  // At least 1 record per file
@@ -274,10 +274,12 @@ case class DeltaOptimizedWriterExec(
       logInfo("Using ShuffleManager API for optimized write (remote shuffle service mode)")
     }
 
-    // Estimate and set maxRecordsPerFile if targetFileSize is configured
-    val targetFileSize = getConf(DeltaSQLConf.DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE)
-    if (useShuffleManager && targetFileSize > 0) {
-      estimateMaxRecordsPerFile(targetFileSize).foreach { maxRecords =>
+    // Estimate and set maxRecordsPerFile based on binSize for remote shuffle mode
+    // This helps control output file size when reducers exceed binSize
+    if (useShuffleManager) {
+      val maxBinSize = ByteUnit.BYTE.convertFrom(
+        getConf(DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE), ByteUnit.MiB)
+      estimateMaxRecordsPerFile(maxBinSize).foreach { maxRecords =>
         // Set as thread-local property to be picked up by the write path
         sparkContext.setLocalProperty(
           "spark.sql.files.maxRecordsPerFile",

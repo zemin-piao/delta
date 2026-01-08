@@ -447,42 +447,42 @@ abstract class OptimizedWritesSuiteBase extends QueryTest
     }
   }
 
-  test("optimized write with targetFileSize limits output file size") {
+  test("optimized write with binSize limits output file size") {
     withTempDir { dir =>
       // First, write some data to establish baseline statistics
       val setupDf = spark.range(0, 10000, 1, 4).toDF()
       setupDf.write.format("delta").save(dir.getCanonicalPath)
 
-      // Now write more data with targetFileSize enabled
+      // Now write more data with binSize controlling output file size
       withSQLConf(
         DeltaSQLConf.DELTA_OPTIMIZE_WRITE_ENABLED.key -> "true",
         DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true",
-        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE.key -> "1048576"  // 1MB
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE.key -> "1"  // 1 MiB
       ) {
         val df = spark.range(10000, 110000, 1, 10).toDF()
         df.write.format("delta").mode("append").save(dir.getCanonicalPath)
       }
 
-      // Verify files are reasonably sized (within 2x of target due to estimation variance)
+      // Verify files are reasonably sized (within 2x of binSize due to estimation variance)
       val (_, snapshot) = DeltaLog.forTableWithSnapshot(spark, dir.getCanonicalPath)
       val newFiles = snapshot.allFiles.collect().filter(_.size > 0)
       val maxFileSize = newFiles.map(_.size).max
 
-      assert(maxFileSize < 2 * 1048576, s"Max file size $maxFileSize exceeds 2x target")
+      assert(maxFileSize < 2 * 1048576, s"Max file size $maxFileSize exceeds 2x binSize")
     }
   }
 
-  test("optimized write targetFileSize disabled for new tables without stats") {
+  test("optimized write with binSize gracefully handles new tables without stats") {
     withTempDir { dir =>
       withSQLConf(
         DeltaSQLConf.DELTA_OPTIMIZE_WRITE_ENABLED.key -> "true",
         DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true",
-        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE.key -> "1048576"
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE.key -> "1"  // 1 MiB
       ) {
         // New table - no existing files to sample
         val df = spark.range(0, 10000, 1, 4).toDF()
 
-        // Should complete without error, targetFileSize silently disabled
+        // Should complete without error, maxRecordsPerFile estimation silently disabled
         df.write.format("delta").save(dir.getCanonicalPath)
 
         val result = spark.read.format("delta").load(dir.getCanonicalPath)

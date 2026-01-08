@@ -2739,6 +2739,26 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(false)
 
+  val DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE =
+    buildConf("optimizeWrite.targetFileSize")
+      .doc(
+        "Target file size in bytes for optimized writes. When useShuffleManager=true and a " +
+        "reducer exceeds binSize, this setting controls the maximum output file size by " +
+        "estimating maxRecordsPerFile based on historical table statistics. " +
+        "Set to 0 to disable (default). Recommended value: 134217728 (128MB)."
+      )
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ >= 0, "targetFileSize must be non-negative")
+      .createWithDefault(0)
+
+  val DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE_SAMPLE_SIZE =
+    buildConf("optimizeWrite.targetFileSize.sampleSize")
+      .internal()
+      .doc("Number of files to sample when estimating avgBytesPerRecord for targetFileSize calculation.")
+      .intConf
+      .checkValue(_ > 0, "sampleSize must be positive")
+      .createWithDefault(100)
+
   val DELTA_OPTIMIZE_CLUSTERING_MIN_CUBE_SIZE =
   buildConf("optimize.clustering.mergeStrategy.minCubeSize.threshold")
     .internal()

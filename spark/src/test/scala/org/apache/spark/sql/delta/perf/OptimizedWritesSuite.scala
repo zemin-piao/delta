@@ -350,6 +350,146 @@ abstract class OptimizedWritesSuiteBase extends QueryTest
         dir)
     }
   }
+
+  test("useShuffleManager defaults to false") {
+    assert(spark.conf.get(DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER) === false)
+  }
+
+  test("optimized write with useShuffleManager=true - non-partitioned") {
+    withTempDir { dir =>
+      withSQLConf(
+        DeltaConfigs.OPTIMIZE_WRITE.defaultTablePropertyKey -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true"
+      ) {
+        val df = spark.range(0, 100, 1, 4).toDF()
+        df.write.format("delta").save(dir.getCanonicalPath)
+
+        checkResult(
+          df,
+          numFileCheck = _ >= 1,  // At least 1 file
+          dir.getCanonicalPath
+        )
+      }
+    }
+  }
+
+  test("optimized write with useShuffleManager=true - partitioned") {
+    withTempDir { dir =>
+      withSQLConf(
+        DeltaConfigs.OPTIMIZE_WRITE.defaultTablePropertyKey -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true"
+      ) {
+        val df = spark.range(0, 100, 1, 4).withColumn("part", 'id % 5)
+        df.write.partitionBy("part").format("delta").save(dir.getCanonicalPath)
+
+        checkResult(
+          df,
+          numFileCheck = _ <= 5,  // At most 1 file per partition
+          dir.getCanonicalPath
+        )
+      }
+    }
+  }
+
+  test("optimized write with useShuffleManager=true - large reducers get own bins") {
+    withTempDir { dir =>
+      withSQLConf(
+        DeltaConfigs.OPTIMIZE_WRITE.defaultTablePropertyKey -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_BIN_SIZE.key -> "1"  // 1MB bin size to force large reducers
+      ) {
+        // Create data that will produce reducers larger than 1MB
+        val df = spark.range(0, 100000, 1, 4).toDF()
+        df.write.format("delta").save(dir.getCanonicalPath)
+
+        // Verify data integrity - no duplicates
+        val result = spark.read.format("delta").load(dir.getCanonicalPath)
+        assert(result.count() == 100000)
+        assert(result.distinct().count() == 100000)
+      }
+    }
+  }
+
+  test("optimized write with useShuffleManager=true - no data duplication") {
+    withTempDir { dir =>
+      withSQLConf(
+        DeltaConfigs.OPTIMIZE_WRITE.defaultTablePropertyKey -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true"
+      ) {
+        val inputCount = 10000
+        val df = spark.range(0, inputCount, 1, 10).toDF()
+        df.write.format("delta").save(dir.getCanonicalPath)
+
+        val result = spark.read.format("delta").load(dir.getCanonicalPath)
+
+        // Critical: verify no duplicates
+        assert(result.count() == inputCount, "Row count mismatch - possible duplication")
+        assert(result.distinct().count() == inputCount, "Distinct count mismatch - duplicates detected")
+      }
+    }
+  }
+
+  test("optimized write with useShuffleManager=true - logs planned event") {
+    withTempDir { dir =>
+      withSQLConf(
+        DeltaConfigs.OPTIMIZE_WRITE.defaultTablePropertyKey -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true"
+      ) {
+        val df = spark.range(0, 100, 1, 4).toDF()
+
+        val logs = Log4jUsageLogger.track {
+          df.write.format("delta").save(dir.getCanonicalPath)
+        }.filter(_.metric == "tahoeEvent")
+          .filter(_.tags.get("opType") === Some("delta.optimizeWrite.planned"))
+
+        assert(logs.length === 1)
+      }
+    }
+  }
+
+  test("optimized write with targetFileSize limits output file size") {
+    withTempDir { dir =>
+      // First, write some data to establish baseline statistics
+      val setupDf = spark.range(0, 10000, 1, 4).toDF()
+      setupDf.write.format("delta").save(dir.getCanonicalPath)
+
+      // Now write more data with targetFileSize enabled
+      withSQLConf(
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_ENABLED.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE.key -> "1048576"  // 1MB
+      ) {
+        val df = spark.range(10000, 110000, 1, 10).toDF()
+        df.write.format("delta").mode("append").save(dir.getCanonicalPath)
+      }
+
+      // Verify files are reasonably sized (within 2x of target due to estimation variance)
+      val (_, snapshot) = DeltaLog.forTableWithSnapshot(spark, dir.getCanonicalPath)
+      val newFiles = snapshot.allFiles.collect().filter(_.size > 0)
+      val maxFileSize = newFiles.map(_.size).max
+
+      assert(maxFileSize < 2 * 1048576, s"Max file size $maxFileSize exceeds 2x target")
+    }
+  }
+
+  test("optimized write targetFileSize disabled for new tables without stats") {
+    withTempDir { dir =>
+      withSQLConf(
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_ENABLED.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_USE_SHUFFLE_MANAGER.key -> "true",
+        DeltaSQLConf.DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE.key -> "1048576"
+      ) {
+        // New table - no existing files to sample
+        val df = spark.range(0, 10000, 1, 4).toDF()
+
+        // Should complete without error, targetFileSize silently disabled
+        df.write.format("delta").save(dir.getCanonicalPath)
+
+        val result = spark.read.format("delta").load(dir.getCanonicalPath)
+        assert(result.count() == 10000)
+      }
+    }
+  }
 }
 
 class OptimizedWritesSuite extends OptimizedWritesSuiteBase with DeltaSQLCommandTest {}

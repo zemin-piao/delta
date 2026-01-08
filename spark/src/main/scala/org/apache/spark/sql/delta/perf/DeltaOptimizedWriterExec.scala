@@ -150,10 +150,10 @@ case class DeltaOptimizedWriterExec(
       // Verify no reducer is split across multiple bins (would cause duplicate data)
       val reducerToBinCount = result.zipWithIndex.flatMap { case (bin, binIdx) =>
         bin.map(_.asInstanceOf[ShuffleBlockId].reduceId).distinct.map(_ -> binIdx)
-      }.groupBy(_._1).mapValues(_.map(_._2).distinct.size)
+      }.groupBy(_._1).map { case (k, v) => k -> v.map(_._2).distinct.size }
 
       val duplicates = reducerToBinCount.filter(_._2 > 1)
-      assert(duplicates.isEmpty,
+      require(duplicates.isEmpty,
         s"Reducer(s) split across multiple bins in remote shuffle mode, " +
           s"which would cause data duplication: ${duplicates.keys.mkString(", ")}")
 
@@ -216,6 +216,52 @@ case class DeltaOptimizedWriterExec(
     }
   }
 
+  /**
+   * Estimates maxRecordsPerFile based on historical table statistics.
+   *
+   * Algorithm:
+   * 1. Sample N files from the existing table (default: 100)
+   * 2. Calculate avgBytesPerRecord = totalSampleBytes / totalSampleRecords
+   * 3. Return targetFileSize / avgBytesPerRecord
+   *
+   * @param targetFileSize Desired maximum file size in bytes
+   * @return Some(maxRecordsPerFile) if estimation possible, None otherwise
+   */
+  private def estimateMaxRecordsPerFile(targetFileSize: Long): Option[Long] = {
+    if (targetFileSize <= 0) return None
+
+    val sampleSize = getConf(DeltaSQLConf.DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE_SAMPLE_SIZE)
+    val snapshot = deltaLog.unsafeVolatileSnapshot
+
+    // Sample files from the table - O(sampleSize), not O(totalFiles)
+    val sampleFiles = snapshot.allFiles
+      .limit(sampleSize)
+      .collect()
+      .filter(f => f.numRecords.isDefined && f.numRecords.get > 0 && f.size > 0)
+
+    // Need minimum 10 files with valid stats for reliable estimation
+    if (sampleFiles.length < 10) {
+      logWarning(
+        s"Insufficient files with statistics (${sampleFiles.length}) to estimate " +
+        s"maxRecordsPerFile. targetFileSize will not be enforced."
+      )
+      return None
+    }
+
+    val totalBytes = sampleFiles.map(_.size).sum
+    val totalRecords = sampleFiles.flatMap(_.numRecords).sum
+    val avgBytesPerRecord = totalBytes.toDouble / totalRecords
+
+    val maxRecordsPerFile = (targetFileSize / avgBytesPerRecord).toLong
+
+    logInfo(
+      s"Estimated avgBytesPerRecord=$avgBytesPerRecord from ${sampleFiles.length} files. " +
+      s"Setting maxRecordsPerFile=$maxRecordsPerFile for targetFileSize=$targetFileSize"
+    )
+
+    Some(math.max(1, maxRecordsPerFile))  // At least 1 record per file
+  }
+
   override def doExecute(): RDD[InternalRow] = {
     // Single partitioned tasks can simply be written
     if (childNumPartitions <= 1) return child.execute()
@@ -223,6 +269,22 @@ case class DeltaOptimizedWriterExec(
     val shuffledRDD = getShuffleRDD
 
     val partitions = computeBins()
+
+    if (useShuffleManager) {
+      logInfo("Using ShuffleManager API for optimized write (remote shuffle service mode)")
+    }
+
+    // Estimate and set maxRecordsPerFile if targetFileSize is configured
+    val targetFileSize = getConf(DeltaSQLConf.DELTA_OPTIMIZE_WRITE_TARGET_FILE_SIZE)
+    if (useShuffleManager && targetFileSize > 0) {
+      estimateMaxRecordsPerFile(targetFileSize).foreach { maxRecords =>
+        // Set as thread-local property to be picked up by the write path
+        sparkContext.setLocalProperty(
+          "spark.sql.files.maxRecordsPerFile",
+          maxRecords.toString
+        )
+      }
+    }
 
     recordDeltaEvent(deltaLog,
       "delta.optimizeWrite.planned",
